@@ -1,0 +1,72 @@
+name: restate-example
+
+services:
+  # Restate runtime: ingress on 8080, Admin API + UI on 9070.
+  restate:
+    image: docker.restate.dev/restatedev/restate:1.8.1
+    container_name: restate
+    command: ["--base-dir", "/restate-data", "--node-name", "restate-1"]
+    ports:
+      - "${RESTATE_INGRESS_PORT:-8080}:8080"
+      - "${RESTATE_ADMIN_PORT:-9070}:9070"
+    volumes:
+      - restate-data:/restate-data
+    restart: unless-stopped
+
+  # The durable service. It only speaks the Restate SDK protocol on 9080,
+  # so it is not published to the host: all calls go through Restate.
+  order-service:
+    build:
+      context: ./order-service
+    container_name: order-service
+    expose:
+      - "9080"
+    restart: unless-stopped
+
+  # One-shot container that registers both deployments in Restate.
+  # It retries until both services are ready, then exits 0.
+  restate-register:
+    image: docker.restate.dev/restatedev/restate-cli:1.8.1
+    container_name: restate-register
+    depends_on:
+      restate:
+        condition: service_started
+      order-service:
+        condition: service_started
+      api-service:
+        condition: service_started
+    environment:
+      RESTATE_ADMIN_URL: http://restate:9070
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until restate -y deployments register --force http://order-service:9080; do
+          echo "Waiting for order-service to accept the deployment..."
+          sleep 2
+        done
+        until restate -y deployments register --force http://api-service:9080; do
+          echo "Waiting for api-service (NotificationService) to accept the deployment..."
+          sleep 2
+        done
+
+  # FastAPI facade with Swagger on 8000, plus a Restate endpoint on 9080 that
+  # serves NotificationService. The order service calls it back through Restate.
+  api-service:
+    build:
+      context: ./api-service
+    container_name: api-service
+    ports:
+      - "${API_PORT:-8000}:8000"
+    expose:
+      - "9080"
+    environment:
+      RESTATE_INGRESS_URL: http://restate:8080
+    depends_on:
+      restate:
+        condition: service_started
+      order-service:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  restate-data:
